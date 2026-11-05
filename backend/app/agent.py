@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import hashlib
+import html
+import re
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .chain import verify_batch
+from .models import AgentConversation, AgentMessage, AuditEvent, DelegatedTask, Observation, Patient, SourceBatch, User
+
+ALLOWED_CRAWL_HOSTS = {"moh.gov.my", "www.moh.gov.my", "mems.my", "www.mems.my"}
+ALLOWED_TASKS = {"evidence_reviewer", "regional_analyst", "integrity_verifier", "source_crawler"}
+
+
+def enqueue_task(db: Session, user: User, task_type: str, input_data: dict) -> DelegatedTask:
+    if task_type not in ALLOWED_TASKS:
+        raise ValueError("Unsupported subagent task")
+    if task_type == "source_crawler" and user.role != "administrator":
+        raise PermissionError("Only an administrator can request a public-source crawl")
+    task = DelegatedTask(requester_id=user.id, task_type=task_type, input_data=input_data)
+    db.add(task)
+    db.flush()
+    db.add(AuditEvent(actor_id=user.id, event_type="agent.subagent_queued", entity_type="delegated_task", entity_id=task.id, detail={"task_type": task_type}))
+    return task
+
+
+def process_task(db: Session, task: DelegatedTask) -> DelegatedTask:
+    requester = db.get(User, task.requester_id)
+    task.status = "running"
+    if task.task_type == "evidence_reviewer":
+        patient = db.get(Patient, task.input_data.get("patient_id"))
+        if not patient or not requester or (requester.role == "clinician" and requester.organization_id != patient.organization_id):
+            task.output_data = {"error": "Authorised patient evidence is unavailable."}
+        else:
+            observations = list(db.scalars(select(Observation).where(Observation.patient_id == patient.id).order_by(Observation.observed_at)).all())
+            task.output_data = {"patient_reference": patient.reference, "observation_count": len(observations), "instruction": "Use the CPG review tree in the patient record; no diagnosis or treatment recommendation is generated."}
+    elif task.task_type == "integrity_verifier":
+        batch = db.get(SourceBatch, task.input_data.get("batch_id"))
+        observations = list(db.scalars(select(Observation)).all())
+        task.output_data = verify_batch(batch, observations) if batch else {"error": "Batch not found."}
+    elif task.task_type == "regional_analyst":
+        task.output_data = {"instruction": "Regional analysis is returned only through the fixed, authorised aggregate endpoint.", "status": "handoff_required"}
+    else:
+        task.output_data = _crawl_public_source(task.input_data.get("url", ""))
+    task.status = "completed"
+    task.completed_at = datetime.now(timezone.utc)
+    db.add(AuditEvent(actor_id=task.requester_id, event_type="agent.subagent_completed", entity_type="delegated_task", entity_id=task.id, detail={"task_type": task.task_type, "status": task.status}))
+    return task
+
+
+def process_pending_tasks(db: Session) -> int:
+    tasks = list(db.scalars(select(DelegatedTask).where(DelegatedTask.status == "queued")).all())
+    for task in tasks:
+        process_task(db, task)
+    return len(tasks)
+
+
+def chat(db: Session, user: User, content: str, conversation_id: str | None = None) -> dict:
+    conversation = db.get(AgentConversation, conversation_id) if conversation_id else None
+    if conversation and conversation.user_id != user.id:
+        raise PermissionError("Conversation is not available to this user")
+    if not conversation:
+        conversation = AgentConversation(user_id=user.id)
+        db.add(conversation)
+        db.flush()
+    db.add(AgentMessage(conversation_id=conversation.id, role="user", content=content, tool_events=[]))
+    text = content.strip().lower()
+    events: list[dict] = []
+    if text.startswith("crawl "):
+        task = enqueue_task(db, user, "source_crawler", {"url": content.strip()[6:].strip()})
+        answer = "I queued an allowlisted public-source crawl. It will fetch reference material only; no clinical records leave Sentinel Network."
+        events.append({"type": "source_crawler", "task_id": task.id})
+    elif "integrity" in text or "blockchain" in text:
+        batch = db.scalar(select(SourceBatch).order_by(SourceBatch.created_at.desc()))
+        task = enqueue_task(db, user, "integrity_verifier", {"batch_id": batch.id if batch else ""})
+        answer = "I queued the integrity verifier against the current source batch. It will return commitment evidence, not a fabricated receipt."
+        events.append({"type": "integrity_verifier", "task_id": task.id})
+    elif "patient" in text or "evidence" in text:
+        answer = "For an evidence review, open an authorised patient record and choose ‘Delegate evidence review’. I will enforce your organisation boundary and return only rule evidence and data-quality context."
+    elif "regional" in text or "district" in text:
+        answer = "Regional analysis is limited to authorised, fixed aggregate queries with denominator and small-cell controls. I can hand that to the aggregate-analysis subagent after grant verification."
+    else:
+        answer = "I am Sentinel Agent. I can queue an authorised evidence review, integrity verification, fixed aggregate-analysis handoff, or an administrator-approved crawl of MOH/MEMS public guidance. I do not diagnose, prescribe, contact patients, or access data outside your role."
+    db.add(AgentMessage(conversation_id=conversation.id, role="assistant", content=answer, tool_events=events))
+    db.add(AuditEvent(actor_id=user.id, event_type="agent.chat", entity_type="agent_conversation", entity_id=conversation.id, detail={"tool_events": events}))
+    return {"conversation_id": conversation.id, "message": answer, "tool_events": events}
+
+
+def _crawl_public_source(url: str) -> dict:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_CRAWL_HOSTS:
+        return {"error": "Crawler only permits HTTPS pages on the approved MOH and MEMS domains."}
+    request = urllib.request.Request(url, headers={"User-Agent": "SentinelNetworkDemo/1.0 (synthetic-only reference crawler)"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read(50_000).decode("utf-8", errors="replace")
+            final_url = response.url
+    except Exception as exc:
+        return {"error": f"Crawl failed: {type(exc).__name__}"}
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(raw))).strip()
+    return {"source_url": final_url, "content_sha256": hashlib.sha256(raw.encode()).hexdigest(), "excerpt": text[:800], "notice": "Reference-only crawl; clinician validation is required."}

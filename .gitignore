@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+backend/.venv/
+backend/sentinel.db
+backend/test_sentinel.db
+backend/*.egg-info/
+
+# Node
+node_modules/
+frontend/node_modules/
+contracts/node_modules/
+frontend/dist/
+contracts/artifacts/
+contracts/cache/
+contracts/typechain-types/
+frontend/*.tsbuildinfo
+
+# Local pitch work and generated delivery artefacts are not application source.
+.pitch-build/
+output/
+
+# Supplied clinical reference remains local; the repository cites it but does not redistribute it.
+CPG Management of Type 2 Diabetes Mellitus (6th Edition) 20210413.pdf
+
+# Secrets and deployment state
+.env
+.env.*
+!.env.example
+*.key
+.vercel/
+.openai/
+supabase/.temp/
+backend/app/chain/contract_metadata.json
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

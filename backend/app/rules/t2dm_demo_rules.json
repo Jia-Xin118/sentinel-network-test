@@ -1,0 +1,17 @@
+{
+  "version": "cpg-t2dm-6e-demo-v1",
+  "source": "MOH Malaysia CPG Management of Type 2 Diabetes Mellitus, 6th Edition (2020/2021)",
+  "disclaimer": "Illustrative demo rules; clinician validation required. Not a diagnosis or treatment engine.",
+  "accepted_units": {
+    "hba1c": ["%"],
+    "fpg": ["mmol/L"],
+    "rpg": ["mmol/L"],
+    "egfr": ["mL/min/1.73m2"]
+  },
+  "references": {
+    "diagnosis": "Section 2.4, pages 25-29",
+    "initial_assessment": "Section 3.1, pages 31-35",
+    "monitoring": "Section 3.8, pages 82-86",
+    "scope": "The supplied T2DM CPG excludes diabetes in pregnancy."
+  }
+}
