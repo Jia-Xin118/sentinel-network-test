@@ -405,3 +405,63 @@ class KeyProtectedMCP:
 
 
 app = KeyProtectedMCP(mcp.streamable_http_app())
+
+
+# --- Aggregate cohort counts for agents (no identifiers, small cells suppressed) ---
+from collections import Counter, defaultdict
+
+from .care_gap import _latest_medications
+from .models import MedicationStatement
+from .terminology import SGLT2_ATC_GROUP
+
+COHORT_SMALL_CELL = 5
+
+
+def _cohort_cell(count: int):
+    """Show 0 and counts of 5+ exactly; hide 1-4 so no small group can be singled out."""
+    return count if count == 0 or count >= COHORT_SMALL_CELL else "1-4 (suppressed)"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
+def cohort_summary() -> dict:
+    """Read aggregate counts only, inside the key's approved boundary: total synthetic patients,
+    review-status counts and patients on key medication classes. Returns no identifiers or
+    records; counts of 1-4 are suppressed. Clinicians need clinical:read:organisation (own
+    hospital only); CAIO needs clinical:read:system. Counts describe synthetic data and are
+    not a diagnosis or treatment recommendation."""
+    with SessionLocal() as db:
+        boundary = authorize_clinical_listing(db, "cohort_summary")
+        query = select(Patient)
+        if boundary:
+            query = query.where(Patient.organization_id == boundary)
+        patients = list(db.scalars(query).all())
+        ids = [patient.id for patient in patients]
+        observations = defaultdict(list)
+        medications = defaultdict(list)
+        if ids:
+            for item in db.scalars(select(Observation).where(Observation.patient_id.in_(ids))).all():
+                observations[item.patient_id].append(item)
+            for item in db.scalars(select(MedicationStatement).where(MedicationStatement.patient_id.in_(ids))).all():
+                medications[item.patient_id].append(item)
+        statuses = Counter(assessment(patient, observations[patient.id])["status"] for patient in patients)
+        on_metformin = 0
+        on_sglt2 = 0
+        for patient_id in ids:
+            active = [item for item in _latest_medications(medications[patient_id])
+                      if item.status == "active" and item.terminology_status == "verified"]
+            codes = [item.atc_code or "" for item in active]
+            on_metformin += any(code == "A10BA02" for code in codes)
+            on_sglt2 += any(code.startswith(SGLT2_ATC_GROUP) for code in codes)
+    return {
+        "data_label": "Synthetic data — demonstration only",
+        "scope": "own organisation" if boundary else "all synthetic organisations",
+        "total_patients": _cohort_cell(len(patients)),
+        "review_status_counts": {status: _cohort_cell(count) for status, count in sorted(statuses.items())},
+        "active_medication_patients": {
+            "metformin": _cohort_cell(on_metformin),
+            "sglt2_inhibitor": _cohort_cell(on_sglt2),
+        },
+        "small_cell_rule": "Counts of 1-4 are suppressed.",
+        "clinical_boundary": "Aggregate counts for clinician review planning only; no diagnosis, prescribing or referral.",
+    }
+    
