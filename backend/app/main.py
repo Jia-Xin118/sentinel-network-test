@@ -614,3 +614,24 @@ def serialize_mdt_review(review: MdtReview) -> dict:
 from .mcp_server import app as protected_mcp_app
 
 app.mount("/", protected_mcp_app, name="mcp")
+
+# The MCP app is mounted inside this FastAPI app, and Starlette does not run a mounted
+# app's lifespan. Start the MCP session manager here so /mcp works in a single process
+# (hosted deployments). The separate MCP listener runs it through its own lifespan.
+from contextlib import asynccontextmanager
+from .mcp_server import mcp as _mcp
+
+_base_lifespan = app.router.lifespan_context
+
+
+@asynccontextmanager
+async def _lifespan_with_mcp(application):
+    async with _base_lifespan(application):
+        if get_settings().mcp_enabled:
+            async with _mcp.session_manager.run():
+                yield
+        else:
+            yield
+
+
+app.router.lifespan_context = _lifespan_with_mcp
